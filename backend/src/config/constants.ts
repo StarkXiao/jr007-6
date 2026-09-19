@@ -94,6 +94,7 @@ export const WORKER_HEARTBEAT_KEY = "psdm:worker:heartbeat";
 
 export const AUDIT_ACTIONS = {
   REVIEW_APPROVE: "review.approve",
+  REVIEW_STALE_CONFIRM: "review.stale.confirm",
   REVIEW_REJECT: "review.reject",
   REVIEW_REQUEST_CHANGES: "review.request_changes",
   REVIEW_CLAIM: "review.claim",
@@ -128,6 +129,16 @@ export const CONFIRMATION_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** 过期上报达到该数量后条目进入待复核 */
 export const STALE_REPORT_THRESHOLD = 3;
+
+/** 新鲜度跌破该分数且本轮无人确认 → 每日巡检标记过期 */
+export const FRESHNESS_STALE_SCORE = 30;
+
+/** 众包翻案：本轮内达到该数量的近期准确确认且分数回升 → 自动摘除过期标记 */
+export const FRESHNESS_RECOVERY_CONFIRMS = 3;
+export const FRESHNESS_RECOVERY_SCORE = 60;
+
+/** “近期确认”窗口，与筛选面板“仅看 90 天内确认过的”保持一致 */
+export const FRESHNESS_RECENT_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
 
 /** 举报合并窗口 */
 export const REPORT_MERGE_WINDOW_MS = 24 * 60 * 60 * 1000;

@@ -17,6 +17,7 @@ import type { AuthUser } from "../../types/auth";
 
 export interface QueueQuery {
   status?: ReviewStatus;
+  kind?: "submission" | "stale_recheck";
   categoryCode?: string;
   hasMedia?: boolean;
   overdueOnly?: boolean;
@@ -32,6 +33,7 @@ export async function listQueue(query: QueueQuery) {
 
   const where: Prisma.ReviewTaskWhereInput = {
     status: query.status ?? { in: ["pending", "in_review"] },
+    ...(query.kind ? { kind: query.kind } : {}),
   };
 
   const spotFilter: Prisma.SpotWhereInput = {};
@@ -55,6 +57,10 @@ export async function listQueue(query: QueueQuery) {
             uuid: true,
             title: true,
             status: true,
+            isStale: true,
+            freshnessScore: true,
+            confirmCount: true,
+            staleReportCount: true,
             category: { select: { code: true, name: true, color: true, icon: true } },
             owner: { select: { uuid: true, nickname: true, creditScore: true, approvedCount: true } },
           },
@@ -81,6 +87,7 @@ export async function listQueue(query: QueueQuery) {
   return pagedResult(
     items.map((task) => ({
       id: task.id,
+      kind: task.kind,
       status: task.status,
       priority: task.priority,
       createdAt: task.createdAt,
@@ -93,6 +100,12 @@ export async function listQueue(query: QueueQuery) {
         uuid: task.spot.uuid,
         title: task.spot.title,
         status: task.spot.status,
+        isStale: task.spot.isStale,
+        freshness: {
+          score: task.spot.freshnessScore,
+          confirmCount: task.spot.confirmCount,
+          staleReportCount: task.spot.staleReportCount,
+        },
         category: task.spot.category,
         mediaCount: mediaCountBySpot.get(task.spotId.toString()) ?? 0,
         author: {
@@ -179,6 +192,7 @@ export async function getTaskDetail(taskId: bigint, moderator: AuthUser) {
             take: 5,
             select: {
               id: true,
+              kind: true,
               status: true,
               reasonCode: true,
               decisionReason: true,
@@ -206,8 +220,26 @@ export async function getTaskDetail(taskId: bigint, moderator: AuthUser) {
   const now = Date.now();
   const lockActive = task.lockedUntil !== null && task.lockedUntil.getTime() > now;
 
+  // 过期复查任务要把“众包怎么说”摆在审核员眼前：本轮确认/上报数与最近一条记录
+  const [recentConfirm, recentStale] =
+    task.kind === "stale_recheck"
+      ? await Promise.all([
+          prisma.spotConfirmation.findFirst({
+            where: { spotId: task.spot.id, isAccurate: true, ...(task.spot.freshnessResetAt ? { createdAt: { gt: task.spot.freshnessResetAt } } : {}) },
+            orderBy: { createdAt: "desc" },
+            select: { createdAt: true, note: true, user: { select: { nickname: true } } },
+          }),
+          prisma.spotConfirmation.findFirst({
+            where: { spotId: task.spot.id, isAccurate: false, ...(task.spot.freshnessResetAt ? { createdAt: { gt: task.spot.freshnessResetAt } } : {}) },
+            orderBy: { createdAt: "desc" },
+            select: { createdAt: true, note: true, user: { select: { nickname: true } } },
+          }),
+        ])
+      : [null, null];
+
   return {
     id: task.id,
+    kind: task.kind,
     status: task.status,
     priority: task.priority,
     autoCheck: task.autoCheck ?? {},
@@ -233,6 +265,18 @@ export async function getTaskDetail(taskId: bigint, moderator: AuthUser) {
       title: task.spot.title,
       description: task.spot.description,
       attributes: task.spot.attributes,
+      freshness: {
+        score: task.spot.freshnessScore,
+        isStale: task.spot.isStale,
+        confirmCount: task.spot.confirmCount,
+        staleReportCount: task.spot.staleReportCount,
+        recentConfirm: recentConfirm
+          ? { at: recentConfirm.createdAt, by: recentConfirm.user.nickname, note: recentConfirm.note }
+          : null,
+        recentStaleReport: recentStale
+          ? { at: recentStale.createdAt, by: recentStale.user.nickname, note: recentStale.note }
+          : null,
+      },
       category: {
         code: task.spot.category.code,
         name: task.spot.category.name,

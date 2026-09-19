@@ -7,7 +7,7 @@ import { assertAttributesValid } from "../categories/schemaValidator";
 import { requireCategoryByCode } from "../categories/service";
 import { assertAllPublishable } from "../media/service";
 import { notify } from "../../services/notify";
-import { adjustCredit, CREDIT_DELTAS, incrementApprovedCount } from "../../services/moderation/credit";
+import { adjustCredit, CREDIT_DELTAS, computeFreshness, incrementApprovedCount } from "../../services/moderation/credit";
 import { recordAudit } from "../../services/audit";
 import { logger } from "../../utils/logger";
 import type { AuthUser } from "../../types/auth";
@@ -98,6 +98,9 @@ export async function approveTask(
   const { point, addressText } = await resolvePublicPoint(task.spot);
   const now = new Date();
   const isAppeal = task.status === "appealed";
+  // 过期人工复查任务：条目本来就在地图上，复查确认后要摘除 stale 标记、
+  // 把本轮统计基准移到当前，旧的过期上报不再参与降权。
+  const isStaleRecheck = task.kind === "stale_recheck";
 
   await prisma.$transaction([
     prisma.spot.update({
@@ -110,6 +113,21 @@ export async function approveTask(
         currentRevisionId: task.revisionId,
         publishedAt: task.spot.publishedAt ?? now,
         archivedAt: null,
+        ...(isStaleRecheck
+          ? {
+              isStale: false,
+              freshnessResetAt: now,
+              confirmCount: 0,
+              staleReportCount: 0,
+              freshnessScore: computeFreshness({
+                confirmCount: 0,
+                staleReportCount: 0,
+                lastConfirmedAt: now,
+                publishedAt: task.spot.publishedAt ?? now,
+                now,
+              }),
+            }
+          : {}),
       },
     }),
     prisma.reviewTask.update({
@@ -123,6 +141,34 @@ export async function approveTask(
       },
     }),
   ]);
+
+  if (isStaleRecheck) {
+    // 复查确认本身就是一次权威的人工确认，落库后新鲜度从干净的基准重新累计
+    await prisma.spotConfirmation.create({
+      data: { spotId: task.spotId, userId: moderator.id, isAccurate: true, note: "人工复查确认" },
+    });
+
+    await recordAudit({
+      actorId: moderator.id,
+      action: AUDIT_ACTIONS.REVIEW_STALE_CONFIRM,
+      targetType: "spot",
+      targetId: task.spotId,
+      after: { isStale: false, taskId: taskId.toString() },
+      reason: payload.reason,
+    });
+
+    await notify({
+      userId: task.spot.ownerId,
+      type: "spot_stale",
+      title: "你的记录经人工复查后确认仍然有效",
+      body: `过期标记已解除：${task.spot.title}`,
+      payload: { spotUuid: task.spot.uuid, rechecked: true },
+    });
+
+    logger.info({ taskId: taskId.toString(), moderator: moderator.uuid }, "过期复查确认，摘牌");
+
+    return { status: "published" as const, spotUuid: task.spot.uuid, publicLocation: point, rechecked: true };
+  }
 
   await incrementApprovedCount(task.spot.ownerId);
   await adjustCredit(task.spot.ownerId, CREDIT_DELTAS.SPOT_APPROVED);
@@ -157,6 +203,15 @@ export async function requestChanges(
 ) {
   assertReasonCode(payload.reasonCode);
   const task = await loadDecidableTask(taskId, moderator);
+
+  // 过期复查只有两个出口：仍然有效（摘牌）或确认失效（下架），
+  // 条目本身早已发布，不存在“打回修改后重提”这条路径
+  if (task.kind === "stale_recheck") {
+    throw AppError.unprocessable(
+      ERROR_CODES.SPOT_STATE_INVALID,
+      "过期复查任务不能打回修改：请直接确认仍然有效或确认已失效下架",
+    );
+  }
 
   const points = (payload.points ?? [])
     .map((point) => point.trim())
@@ -210,9 +265,15 @@ export async function rejectTask(
 
   const decisionReason = payload.reason?.trim() || REVIEW_REASON_CODES[payload.reasonCode];
   const now = new Date();
+  const isStaleRecheck = task.kind === "stale_recheck";
 
   await prisma.$transaction([
-    prisma.spot.update({ where: { id: task.spotId }, data: { status: "rejected" } }),
+    // 过期复查确认失效：下架（可恢复），不走 rejected，
+    // 因为这不是对作者的否定，而是现场情况自然变化
+    prisma.spot.update({
+      where: { id: task.spotId },
+      data: isStaleRecheck ? { status: "hidden", publicLat: null, publicLng: null } : { status: "rejected" },
+    }),
     prisma.reviewTask.update({
       where: { id: task.id },
       data: {
@@ -227,7 +288,10 @@ export async function rejectTask(
     }),
   ]);
 
-  await adjustCredit(task.spot.ownerId, CREDIT_DELTAS.SPOT_REJECTED);
+  // 自然过期不扣信用分；只有新提交被驳回才说明内容本身有问题
+  if (!isStaleRecheck) {
+    await adjustCredit(task.spot.ownerId, CREDIT_DELTAS.SPOT_REJECTED);
+  }
 
   await recordAudit({
     actorId: moderator.id,
@@ -235,22 +299,29 @@ export async function rejectTask(
     targetType: "spot",
     targetId: task.spotId,
     reason: decisionReason,
-    after: { reasonCode: payload.reasonCode },
+    after: { reasonCode: payload.reasonCode, kind: task.kind },
   });
 
   await notify({
     userId: task.spot.ownerId,
     type: "review_rejected",
-    title: "这条记录未通过审核",
-    body: `${decisionReason}（依据：${REVIEW_REASON_CODES[payload.reasonCode]}）。你可以在 7 天内提出申诉。`,
+    title: isStaleRecheck ? "你的记录经复查后已下架" : "这条记录未通过审核",
+    body: isStaleRecheck
+      ? `复查确认现场情况已变化（${decisionReason}）。如确认信息仍有效，你可以在 7 天内提出申诉。`
+      : `${decisionReason}（依据：${REVIEW_REASON_CODES[payload.reasonCode]}）。你可以在 7 天内提出申诉。`,
     payload: {
       spotUuid: task.spot.uuid,
       reasonCode: payload.reasonCode,
+      staleRecheck: isStaleRecheck,
       appealDeadline: now.getTime() + APPEAL_WINDOW_MS,
     },
   });
 
-  return { status: "rejected" as const, reasonCode: payload.reasonCode, decisionReason };
+  return {
+    status: (isStaleRecheck ? "hidden" : "rejected") as "hidden" | "rejected",
+    reasonCode: payload.reasonCode,
+    decisionReason,
+  };
 }
 
 // ------------------------------------------------------------------ 申诉终审

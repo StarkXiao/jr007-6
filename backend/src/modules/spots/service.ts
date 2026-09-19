@@ -3,18 +3,17 @@ import { env } from "../../config/env";
 import {
   CONFIRMATION_COOLDOWN_MS,
   ERROR_CODES,
-  STALE_REPORT_THRESHOLD,
   MAX_BBOX_SPAN_DEG,
 } from "../../config/constants";
 import { prisma, toJsonValue } from "../../db/prisma";
 import { AppError } from "../../utils/errors";
 import { parsePagination, pagedResult } from "../../utils/pagination";
 import { assertNoBlockedContent, assertNoPii, checkText } from "../../services/moderation/contentFilter";
-import { computeFreshness } from "../../services/moderation/credit";
 import { boundingBox, fuzzCoordinates, haversineMeters, isValidLatLng, reverseGeocode } from "../../services/geo";
 import { assertAttributesValid, validateAttributes } from "../categories/schemaValidator";
 import { requireCategoryByCode } from "../categories/service";
 import { serializeSpot } from "../shared/serialize";
+import { enqueueStaleRecheck, recalculateSpotFreshness, STALE_REPORTED_ISSUE } from "./freshness";
 import type { AuthUser } from "../../types/auth";
 import { isModerator } from "../../types/auth";
 import { notify } from "../../services/notify";
@@ -724,55 +723,14 @@ export async function confirmSpot(uuid: string, user: AuthUser, isAccurate: bool
     data: { spotId: spot.id, userId: user.id, isAccurate, note: note ?? null },
   });
 
-  const [confirmCount, staleReportCount, lastConfirmed] = await Promise.all([
-    prisma.spotConfirmation.count({ where: { spotId: spot.id, isAccurate: true } }),
-    prisma.spotConfirmation.count({ where: { spotId: spot.id, isAccurate: false } }),
-    prisma.spotConfirmation.findFirst({
-      where: { spotId: spot.id, isAccurate: true },
-      orderBy: { createdAt: "desc" },
-      select: { createdAt: true },
-    }),
-  ]);
+  // 统一走“按本轮信号重算”：时间衰减降权、过期打标、众包翻案的规则只有这一处
+  const state = await recalculateSpotFreshness(spot);
 
-  const freshnessScore = computeFreshness({
-    confirmCount,
-    staleReportCount,
-    lastConfirmedAt: lastConfirmed?.createdAt ?? null,
-    publishedAt: spot.publishedAt,
-  });
-
-  const shouldMarkStale = !isAccurate && staleReportCount >= STALE_REPORT_THRESHOLD;
-
-  await prisma.spot.update({
-    where: { id: spot.id },
-    data: {
-      confirmCount,
-      staleReportCount,
-      freshnessScore,
-      isStale: shouldMarkStale ? true : spot.isStale,
-    },
-  });
-
-  if (shouldMarkStale && !spot.isStale) {
+  let addedReviewTask = false;
+  if (state.markStale && !spot.isStale) {
     // 过期上报达到阈值 → 生成待复核任务，让条目重新回到审核视野
-    const revision = await prisma.spotRevision.findFirst({
-      where: { spotId: spot.id },
-      orderBy: { revisionNo: "desc" },
-      select: { id: true },
-    });
-
-    if (revision) {
-      await prisma.reviewTask.create({
-        data: {
-          spotId: spot.id,
-          revisionId: revision.id,
-          status: "pending",
-          priority: 3,
-          autoCheck: toJsonValue({ issues: [{ code: "STALE_REPORTED", message: "多位用户反馈信息已过期" }] }),
-          slaDueAt: new Date(Date.now() + env.REVIEW_SLA_HOURS * 3600000),
-        },
-      });
-    }
+    const taskId = await enqueueStaleRecheck(spot, STALE_REPORTED_ISSUE, 3);
+    addedReviewTask = taskId !== null;
 
     await notify({
       userId: spot.ownerId,
@@ -781,14 +739,24 @@ export async function confirmSpot(uuid: string, user: AuthUser, isAccurate: bool
       body: "有用户反馈现场情况发生了变化，请抽空确认或更新。",
       payload: { spotUuid: spot.uuid },
     });
+  } else if (state.recovered) {
+    // 多人近期实地复核后翻案：通知作者问号徽标已摘除
+    await notify({
+      userId: spot.ownerId,
+      type: "spot_stale",
+      title: "你记录的这条信息已被重新确认",
+      body: "近期有多位用户实地复核，信息仍然准确，过期标记已自动解除。",
+      payload: { spotUuid: spot.uuid, recovered: true },
+    });
   }
 
   return {
-    confirmCount,
-    staleReportCount,
-    freshnessScore,
-    isStale: shouldMarkStale || spot.isStale,
-    addedReviewTask: shouldMarkStale && !spot.isStale,
+    confirmCount: state.confirmCount,
+    staleReportCount: state.staleReportCount,
+    freshnessScore: state.score,
+    isStale: state.markStale,
+    recovered: state.recovered,
+    addedReviewTask,
   };
 }
 
@@ -869,8 +837,9 @@ export async function appealSpot(uuid: string, user: AuthUser, reason: string) {
   const spot = await prisma.spot.findUnique({ where: { uuid } });
   if (!spot || spot.deletedAt) throw AppError.notFound("该地点不存在");
   if (spot.ownerId !== user.id) throw AppError.forbidden("只能对自己的条目提出申诉");
-  if (spot.status !== "rejected") {
-    throw AppError.unprocessable(ERROR_CODES.SPOT_STATE_INVALID, "只有被驳回的条目才能申诉");
+  // rejected：新提交被驳回；hidden：过期复查后下架。两者都给 7 天申诉窗口
+  if (spot.status !== "rejected" && spot.status !== "hidden") {
+    throw AppError.unprocessable(ERROR_CODES.SPOT_STATE_INVALID, "只有被驳回或下架的条目才能申诉");
   }
 
   const original = await prisma.reviewTask.findFirst({

@@ -28,6 +28,7 @@ const queueQuery = z.object({
   status: z
     .enum(["pending", "in_review", "approved", "changes_requested", "rejected", "auto_rejected", "appealed", "appeal_approved", "appeal_rejected"])
     .optional(),
+  kind: z.enum(["submission", "stale_recheck"]).optional(),
   categoryCode: z.string().max(32).optional(),
   hasMedia: z.coerce.boolean().optional(),
   overdueOnly: z.coerce.boolean().optional(),

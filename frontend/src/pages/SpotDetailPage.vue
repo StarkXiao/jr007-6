@@ -99,16 +99,20 @@ async function confirmAccuracy(isAccurate: boolean) {
 
   busy.value = true;
   try {
-    const result = await api.post<{ confirmCount: number; isStale: boolean; addedReviewTask: boolean }>(
-      `/spots/${uuid.value}/confirm`,
-      { isAccurate },
-    );
+    const result = await api.post<{
+      confirmCount: number;
+      isStale: boolean;
+      recovered: boolean;
+      addedReviewTask: boolean;
+    }>(`/spots/${uuid.value}/confirm`, { isAccurate });
 
     ElMessage.success(
       isAccurate
-        ? "谢谢确认，这条信息会显示得更可信"
+        ? result.recovered
+          ? "感谢实地复核！多位用户确认后，过期标记已自动解除"
+          : "谢谢确认，这条信息会显示得更可信"
         : result.addedReviewTask
-          ? "已记录你的反馈，这条信息会重新进入复核"
+          ? "已记录你的反馈，这条信息会重新进入人工复核"
           : "已记录你的反馈",
     );
     await load();
@@ -140,7 +144,7 @@ const isOwner = computed(
     Boolean(spot.value?.author?.uuid) &&
     spot.value?.author?.uuid === auth.user?.uuid,
 );
-const canAppeal = computed(() => spot.value?.status === "rejected");
+const canAppeal = computed(() => spot.value?.status === "rejected" || spot.value?.status === "hidden");
 
 async function appeal() {
   try {
@@ -211,7 +215,10 @@ onMounted(async () => {
           <div class="detail-meta">
             <span class="badge badge--ok">{{ spot.freshness.confirmCount }} 人确认仍然准确</span>
             <span class="badge">新鲜度 {{ spot.freshness.score }}</span>
-            <span v-if="spot.freshness.isStale" class="badge badge--warn">信息可能已过期</span>
+            <span v-if="spot.freshness.isStale" class="badge badge--warn">信息可能已过期 · 待人工复查</span>
+            <span v-if="spot.freshness.staleReportCount > 0" class="badge">
+              {{ spot.freshness.staleReportCount }} 人反馈已过期
+            </span>
             <span class="badge">{{ spot.stats.commentCount }} 条评论</span>
             <span class="badge">{{ spot.stats.favoriteCount }} 人收藏</span>
           </div>
@@ -254,7 +261,8 @@ onMounted(async () => {
             <el-button :loading="busy" @click="confirmAccuracy(false)">情况已经变了</el-button>
           </div>
           <p class="muted" style="margin: 8px 0 0">
-            同一个人 30 天内只能确认一次。如果有多人反馈过期，这条记录会自动回到审核队列。
+            同一个人 30 天内只能确认一次。多人反馈过期会自动回到人工复核队列；
+            长期无人确认的条目会被时间衰减降权；近期有足够多人实地确认，过期标记也会自动解除。
           </p>
         </section>
 

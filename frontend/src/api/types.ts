@@ -57,7 +57,13 @@ export interface Spot {
   attributes: Record<string, unknown>;
   location: SpotLocation;
   media: MediaItem[];
-  freshness: { score: number; confirmCount: number; isStale: boolean; lastConfirmedAt: string | null };
+  freshness: {
+    score: number;
+    confirmCount: number;
+    staleReportCount: number;
+    isStale: boolean;
+    lastConfirmedAt: string | null;
+  };
   stats: { commentCount: number; favoriteCount: number };
   author: { uuid: string | null; nickname: string } | null;
   publishedAt: string | null;
@@ -152,6 +158,7 @@ export interface BlurRegion {
 
 export interface ReviewQueueItem {
   id: string;
+  kind: "submission" | "stale_recheck";
   status: string;
   priority: number;
   createdAt: string;
@@ -164,6 +171,8 @@ export interface ReviewQueueItem {
     uuid: string;
     title: string;
     status: string;
+    isStale: boolean;
+    freshness: { score: number; confirmCount: number; staleReportCount: number };
     category: { code: string; name: string; color: string; icon: string };
     mediaCount: number;
     author: { uuid: string; nickname: string; creditScore: number; approvedCount: number };
@@ -172,6 +181,7 @@ export interface ReviewQueueItem {
 
 export interface ReviewTaskDetail {
   id: string;
+  kind: "submission" | "stale_recheck";
   status: string;
   priority: number;
   autoCheck: { issues?: Array<{ code: string; message: string }>; passed?: boolean };
@@ -203,9 +213,18 @@ export interface ReviewTaskDetail {
     fuzzRadiusM: number;
     addressText: string | null;
     createdAt: string;
+    freshness: {
+      score: number;
+      isStale: boolean;
+      confirmCount: number;
+      staleReportCount: number;
+      recentConfirm: { at: string; by: string; note: string | null } | null;
+      recentStaleReport: { at: string; by: string; note: string | null } | null;
+    };
     author: { uuid: string; nickname: string; creditScore: number; approvedCount: number };
     history: Array<{
       id: string;
+      kind: "submission" | "stale_recheck";
       status: string;
       reasonCode: string | null;
       decisionReason: string | null;

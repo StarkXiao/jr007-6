@@ -214,6 +214,9 @@ model Spot {
   isStale            Boolean    @default(false) @map("is_stale")
   confirmCount       Int        @default(0) @map("confirm_count")
   staleReportCount   Int        @default(0) @map("stale_report_count")
+  // 本轮新鲜度统计的起点：人工复查确认 / 众包翻案时写入。
+  // 此前的确认与过期上报不再参与计分，避免一次过期被永久记账。
+  freshnessResetAt   DateTime?  @map("freshness_reset_at") @db.Timestamptz(6)
   currentRevisionId  BigInt?    @map("current_revision_id")
   publishedAt        DateTime?  @map("published_at") @db.Timestamptz(6)
   archivedAt         DateTime?  @map("archived_at") @db.Timestamptz(6)
@@ -313,11 +316,17 @@ model BlurRegion {
   @@map("blur_regions")
 }
 
+enum ReviewTaskKind {
+  submission
+  stale_recheck
+}
+
 model ReviewTask {
-  id              BigInt       @id @default(autoincrement())
-  spotId          BigInt       @map("spot_id")
-  revisionId      BigInt       @map("revision_id")
-  status          ReviewStatus @default(pending)
+  id              BigInt          @id @default(autoincrement())
+  spotId          BigInt          @map("spot_id")
+  revisionId      BigInt          @map("revision_id")
+  kind            ReviewTaskKind  @default(submission)
+  status          ReviewStatus    @default(pending)
   priority        Int          @default(0) @db.SmallInt
   autoCheck       Json?        @map("auto_check")
   assignedTo      BigInt?      @map("assigned_to")
@@ -340,6 +349,7 @@ model ReviewTask {
   appealedBy  ReviewTask[] @relation("ReviewAppeal")
 
   @@index([status, priority, createdAt], map: "idx_review_queue")
+  @@index([kind, status], map: "idx_review_kind")
   @@index([assignedTo, status], map: "idx_review_assignee")
   @@index([slaDueAt], map: "idx_review_sla")
   @@map("review_tasks")

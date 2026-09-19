@@ -170,6 +170,33 @@ onMounted(load);
       />
 
       <el-alert
+        v-if="task.kind === 'stale_recheck'"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="这是一次过期复查（条目已在地图上）"
+        style="margin-bottom: 16px"
+      >
+        <p style="margin: 4px 0">
+          众包信号：新鲜度 {{ task.spot.freshness.score }} ·
+          本轮 {{ task.spot.freshness.confirmCount }} 人确认仍然准确 ·
+          {{ task.spot.freshness.staleReportCount }} 人反馈已过期
+        </p>
+        <p v-if="task.spot.freshness.recentStaleReport" style="margin: 4px 0">
+          最近过期反馈：{{ task.spot.freshness.recentStaleReport.by }}
+          （{{ new Date(task.spot.freshness.recentStaleReport.at).toLocaleString("zh-CN") }}）
+          {{ task.spot.freshness.recentStaleReport.note ? `“${task.spot.freshness.recentStaleReport.note}”` : "" }}
+        </p>
+        <p v-if="task.spot.freshness.recentConfirm" style="margin: 4px 0">
+          最近确认：{{ task.spot.freshness.recentConfirm.by }}
+          （{{ new Date(task.spot.freshness.recentConfirm.at).toLocaleString("zh-CN") }}）
+        </p>
+        <p style="margin: 4px 0">
+          「通过」= 现场核实仍然有效，摘牌并清零旧账；「驳回」= 确认已失效，条目下架（不扣作者信用分）。
+        </p>
+      </el-alert>
+
+      <el-alert
         v-if="task.appeal"
         type="warning"
         :closable="false"
@@ -294,13 +321,19 @@ onMounted(load);
             <template #header>审核决策</template>
             <div style="display: flex; flex-direction: column; gap: 10px">
               <el-button type="success" :loading="deciding" :disabled="!canApprove" @click="approve">
-                通过并发布
+                {{ task.kind === "stale_recheck" ? "复查确认仍然有效（摘牌）" : "通过并发布" }}
               </el-button>
-              <el-button :disabled="deciding" @click="openDecision('changes')">要求修改</el-button>
-              <el-button type="danger" plain :disabled="deciding" @click="openDecision('reject')">驳回</el-button>
+              <el-button v-if="task.kind !== 'stale_recheck'" :disabled="deciding" @click="openDecision('changes')">
+                要求修改
+              </el-button>
+              <el-button type="danger" plain :disabled="deciding" @click="openDecision('reject')">
+                {{ task.kind === "stale_recheck" ? "确认已失效（下架）" : "驳回" }}
+              </el-button>
             </div>
             <p class="muted" style="margin: 10px 0 0">
-              三种决策都会写入审计日志，并通过站内通知告知作者。
+              {{ task.kind === "stale_recheck"
+                ? "复查决策会写入审计日志；自然过期下架不扣作者信用分，作者 7 天内可申诉。"
+                : "三种决策都会写入审计日志，并通过站内通知告知作者。" }}
             </p>
           </el-card>
         </el-col>

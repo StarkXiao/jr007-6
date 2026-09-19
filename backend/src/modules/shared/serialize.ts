@@ -71,6 +71,7 @@ export interface SpotLike {
   addressText: string | null;
   freshnessScore: number;
   confirmCount: number;
+  staleReportCount: number;
   isStale: boolean;
   publishedAt: Date | null;
   createdAt: Date;
@@ -113,6 +114,7 @@ export function serializeSpot(spot: SpotLike, options: SpotSerializeOptions = {}
     freshness: {
       score: spot.freshnessScore,
       confirmCount: spot.confirmCount,
+      staleReportCount: spot.staleReportCount,
       isStale: spot.isStale,
       lastConfirmedAt: spot.lastConfirmedAt ?? null,
     },
