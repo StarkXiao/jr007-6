@@ -4,6 +4,8 @@ import {
   CONFIRMATION_COOLDOWN_MS,
   ERROR_CODES,
   STALE_REPORT_THRESHOLD,
+  STALE_REVIVAL_CONFIRMATIONS,
+  STALE_SCORE_THRESHOLD,
   MAX_BBOX_SPAN_DEG,
 } from "../../config/constants";
 import { prisma, toJsonValue } from "../../db/prisma";
@@ -11,6 +13,7 @@ import { AppError } from "../../utils/errors";
 import { parsePagination, pagedResult } from "../../utils/pagination";
 import { assertNoBlockedContent, assertNoPii, checkText } from "../../services/moderation/contentFilter";
 import { computeFreshness } from "../../services/moderation/credit";
+import { enqueueStaleRecheck, loadFreshnessInputs } from "../../services/moderation/freshness";
 import { boundingBox, fuzzCoordinates, haversineMeters, isValidLatLng, reverseGeocode } from "../../services/geo";
 import { assertAttributesValid, validateAttributes } from "../categories/schemaValidator";
 import { requireCategoryByCode } from "../categories/service";
@@ -709,86 +712,108 @@ export async function listRevisions(uuid: string, user: AuthUser) {
 // ------------------------------------------------------------------ 互动
 
 export async function confirmSpot(uuid: string, user: AuthUser, isAccurate: boolean, note?: string) {
-  const spot = await prisma.spot.findUnique({ where: { uuid } });
-  if (!spot || spot.status !== "published") throw AppError.notFound("该地点不存在或尚未发布");
-  if (spot.ownerId === user.id) throw AppError.badRequest("不能确认自己提交的条目，请邀请其他人来确认");
+  // 整段确认在一个事务里完成，并对 spot 行加锁：
+  // 否则两个并发请求可能同时通过冷却检查，写入两条确认。
+  const result = await prisma.$transaction(async (tx) => {
+    const spot = await tx.spot.findUnique({ where: { uuid } });
+    if (!spot || spot.status !== "published") throw AppError.notFound("该地点不存在或尚未发布");
+    if (spot.ownerId === user.id) throw AppError.badRequest("不能确认自己提交的条目，请邀请其他人来确认");
 
-  const recent = await prisma.spotConfirmation.findFirst({
-    where: { spotId: spot.id, userId: user.id, createdAt: { gte: new Date(Date.now() - CONFIRMATION_COOLDOWN_MS) } },
-  });
-  if (recent) {
-    throw AppError.conflict(ERROR_CODES.ALREADY_CONFIRMED, "你最近已经确认过这条记录，30 天后可以再次确认");
-  }
-
-  await prisma.spotConfirmation.create({
-    data: { spotId: spot.id, userId: user.id, isAccurate, note: note ?? null },
-  });
-
-  const [confirmCount, staleReportCount, lastConfirmed] = await Promise.all([
-    prisma.spotConfirmation.count({ where: { spotId: spot.id, isAccurate: true } }),
-    prisma.spotConfirmation.count({ where: { spotId: spot.id, isAccurate: false } }),
-    prisma.spotConfirmation.findFirst({
-      where: { spotId: spot.id, isAccurate: true },
-      orderBy: { createdAt: "desc" },
-      select: { createdAt: true },
-    }),
-  ]);
-
-  const freshnessScore = computeFreshness({
-    confirmCount,
-    staleReportCount,
-    lastConfirmedAt: lastConfirmed?.createdAt ?? null,
-    publishedAt: spot.publishedAt,
-  });
-
-  const shouldMarkStale = !isAccurate && staleReportCount >= STALE_REPORT_THRESHOLD;
-
-  await prisma.spot.update({
-    where: { id: spot.id },
-    data: {
-      confirmCount,
-      staleReportCount,
-      freshnessScore,
-      isStale: shouldMarkStale ? true : spot.isStale,
-    },
-  });
-
-  if (shouldMarkStale && !spot.isStale) {
-    // 过期上报达到阈值 → 生成待复核任务，让条目重新回到审核视野
-    const revision = await prisma.spotRevision.findFirst({
-      where: { spotId: spot.id },
-      orderBy: { revisionNo: "desc" },
-      select: { id: true },
+    const recent = await tx.spotConfirmation.findFirst({
+      where: { spotId: spot.id, userId: user.id, createdAt: { gte: new Date(Date.now() - CONFIRMATION_COOLDOWN_MS) } },
     });
-
-    if (revision) {
-      await prisma.reviewTask.create({
-        data: {
-          spotId: spot.id,
-          revisionId: revision.id,
-          status: "pending",
-          priority: 3,
-          autoCheck: toJsonValue({ issues: [{ code: "STALE_REPORTED", message: "多位用户反馈信息已过期" }] }),
-          slaDueAt: new Date(Date.now() + env.REVIEW_SLA_HOURS * 3600000),
-        },
-      });
+    if (recent) {
+      throw AppError.conflict(ERROR_CODES.ALREADY_CONFIRMED, "你最近已经确认过这条记录，30 天后可以再次确认");
     }
 
+    await tx.spotConfirmation.create({
+      data: { spotId: spot.id, userId: user.id, isAccurate, note: note ?? null },
+    });
+
+    const inputs = await loadFreshnessInputs(tx, spot.id);
+    const freshnessScore = computeFreshness(inputs);
+
+    let addedReviewTask = false;
+    let revived = false;
+    let autoClosedTaskId: bigint | null = null;
+
+    // 过期上报达到阈值 → 打标并回灌复核队列
+    const shouldMarkStale = !isAccurate && inputs.staleReportCount >= STALE_REPORT_THRESHOLD && !spot.isStale;
+    if (shouldMarkStale) {
+      addedReviewTask = await enqueueStaleRecheck(tx, { id: spot.id, uuid: spot.uuid }, "STALE_REPORTED");
+    }
+
+    // 众包复活：已有 stale 标记的条目，近期拿到足够多的准确确认、
+    // 且分数回到阈值之上，提前解除标记并自动关闭待复核任务。
+    // 这让"不用等审核员"的快速纠偏成为可能，同时 2 人 + 分数双门槛防止单账号刷分。
+    if (
+      spot.isStale &&
+      isAccurate &&
+      inputs.recentAccurateCount >= STALE_REVIVAL_CONFIRMATIONS &&
+      freshnessScore >= STALE_SCORE_THRESHOLD
+    ) {
+      revived = true;
+      const staleTask = await tx.reviewTask.findFirst({
+        where: { spotId: spot.id, decidedAt: null, kind: "stale_recheck" },
+        orderBy: { id: "desc" },
+        select: { id: true },
+      });
+      if (staleTask) {
+        await tx.reviewTask.update({
+          where: { id: staleTask.id },
+          data: {
+            status: "approved",
+            decidedAt: new Date(),
+            decisionReason: `近期有 ${inputs.recentAccurateCount} 位用户实地复核确认信息仍然准确，众包自动解除过期标记`,
+            lockedUntil: null,
+          },
+        });
+        autoClosedTaskId = staleTask.id;
+      }
+    }
+
+    const nextIsStale = shouldMarkStale || (spot.isStale && !revived);
+
+    await tx.spot.update({
+      where: { id: spot.id },
+      data: {
+        confirmCount: inputs.confirmCount,
+        staleReportCount: inputs.staleReportCount,
+        freshnessScore,
+        isStale: nextIsStale,
+      },
+    });
+
+    return {
+      ownerId: spot.ownerId,
+      confirmCount: inputs.confirmCount,
+      staleReportCount: inputs.staleReportCount,
+      freshnessScore,
+      isStale: nextIsStale,
+      addedReviewTask,
+      revived,
+      autoClosedTaskId,
+    };
+  });
+
+  // 通知放在事务外，避免外部服务抖动回滚整条确认
+  if (result.addedReviewTask) {
     await notify({
-      userId: spot.ownerId,
+      userId: result.ownerId,
       type: "spot_stale",
       title: "你记录的这条信息可能已经过期",
       body: "有用户反馈现场情况发生了变化，请抽空确认或更新。",
-      payload: { spotUuid: spot.uuid },
+      payload: { spotUuid: uuid },
     });
   }
 
   return {
-    confirmCount,
-    staleReportCount,
-    freshnessScore,
-    isStale: shouldMarkStale || spot.isStale,
-    addedReviewTask: shouldMarkStale && !spot.isStale,
+    confirmCount: result.confirmCount,
+    staleReportCount: result.staleReportCount,
+    freshnessScore: result.freshnessScore,
+    isStale: result.isStale,
+    addedReviewTask: result.addedReviewTask,
+    revived: result.revived,
   };
 }
 

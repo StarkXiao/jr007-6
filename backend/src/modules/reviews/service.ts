@@ -17,6 +17,7 @@ import type { AuthUser } from "../../types/auth";
 
 export interface QueueQuery {
   status?: ReviewStatus;
+  kind?: "submission" | "stale_recheck";
   categoryCode?: string;
   hasMedia?: boolean;
   overdueOnly?: boolean;
@@ -32,6 +33,7 @@ export async function listQueue(query: QueueQuery) {
 
   const where: Prisma.ReviewTaskWhereInput = {
     status: query.status ?? { in: ["pending", "in_review"] },
+    ...(query.kind ? { kind: query.kind } : {}),
   };
 
   const spotFilter: Prisma.SpotWhereInput = {};
@@ -55,6 +57,10 @@ export async function listQueue(query: QueueQuery) {
             uuid: true,
             title: true,
             status: true,
+            isStale: true,
+            freshnessScore: true,
+            confirmCount: true,
+            staleReportCount: true,
             category: { select: { code: true, name: true, color: true, icon: true } },
             owner: { select: { uuid: true, nickname: true, creditScore: true, approvedCount: true } },
           },
@@ -81,6 +87,7 @@ export async function listQueue(query: QueueQuery) {
   return pagedResult(
     items.map((task) => ({
       id: task.id,
+      kind: task.kind,
       status: task.status,
       priority: task.priority,
       createdAt: task.createdAt,
@@ -93,6 +100,10 @@ export async function listQueue(query: QueueQuery) {
         uuid: task.spot.uuid,
         title: task.spot.title,
         status: task.spot.status,
+        isStale: task.spot.isStale,
+        freshnessScore: task.spot.freshnessScore,
+        confirmCount: task.spot.confirmCount,
+        staleReportCount: task.spot.staleReportCount,
         category: task.spot.category,
         mediaCount: mediaCountBySpot.get(task.spotId.toString()) ?? 0,
         author: {
@@ -179,6 +190,7 @@ export async function getTaskDetail(taskId: bigint, moderator: AuthUser) {
             take: 5,
             select: {
               id: true,
+              kind: true,
               status: true,
               reasonCode: true,
               decisionReason: true,
@@ -202,12 +214,30 @@ export async function getTaskDetail(taskId: bigint, moderator: AuthUser) {
     select: { revisionNo: true, snapshot: true, createdAt: true },
   });
 
+  // 复核任务需要看到"为什么被回灌"：最新确认时间与近期确认/上报分布
+  const latestConfirmation = task.kind === "stale_recheck"
+    ? await prisma.spotConfirmation.findFirst({
+        where: { spotId: task.spotId },
+        orderBy: { createdAt: "desc" },
+        select: { createdAt: true, isAccurate: true, note: true },
+      })
+    : null;
+  const recentConfirmations = task.kind === "stale_recheck"
+    ? await prisma.spotConfirmation.findMany({
+        where: { spotId: task.spotId, createdAt: { gte: new Date(Date.now() - 90 * 86400000) } },
+        orderBy: { createdAt: "desc" },
+        take: 20,
+        select: { createdAt: true, isAccurate: true, note: true, user: { select: { nickname: true } } },
+      })
+    : [];
+
   const schema = task.spot.category.schemas[0];
   const now = Date.now();
   const lockActive = task.lockedUntil !== null && task.lockedUntil.getTime() > now;
 
   return {
     id: task.id,
+    kind: task.kind,
     status: task.status,
     priority: task.priority,
     autoCheck: task.autoCheck ?? {},
@@ -233,6 +263,12 @@ export async function getTaskDetail(taskId: bigint, moderator: AuthUser) {
       title: task.spot.title,
       description: task.spot.description,
       attributes: task.spot.attributes,
+      freshness: {
+        score: task.spot.freshnessScore,
+        isStale: task.spot.isStale,
+        confirmCount: task.spot.confirmCount,
+        staleReportCount: task.spot.staleReportCount,
+      },
       category: {
         code: task.spot.category.code,
         name: task.spot.category.name,
@@ -269,6 +305,21 @@ export async function getTaskDetail(taskId: bigint, moderator: AuthUser) {
       regions: asset.blurRegions,
     })),
     reasonCodes: REVIEW_REASON_CODES,
+    // 仅新鲜度回灌任务携带复核上下文，普通审核不暴露这一块
+    recheck:
+      task.kind === "stale_recheck"
+        ? {
+            latestConfirmation: latestConfirmation
+              ? { createdAt: latestConfirmation.createdAt, isAccurate: latestConfirmation.isAccurate, note: latestConfirmation.note }
+              : null,
+            recentConfirmations: recentConfirmations.map((item) => ({
+              createdAt: item.createdAt,
+              isAccurate: item.isAccurate,
+              note: item.note,
+              by: item.user.nickname,
+            })),
+          }
+        : null,
   };
 }
 

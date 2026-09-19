@@ -7,7 +7,9 @@ import { assertAttributesValid } from "../categories/schemaValidator";
 import { requireCategoryByCode } from "../categories/service";
 import { assertAllPublishable } from "../media/service";
 import { notify } from "../../services/notify";
-import { adjustCredit, CREDIT_DELTAS, incrementApprovedCount } from "../../services/moderation/credit";
+import { adjustCredit, CREDIT_DELTAS, computeFreshness, incrementApprovedCount } from "../../services/moderation/credit";
+import { loadFreshnessInputs } from "../../services/moderation/freshness";
+import { CONFIRMATION_COOLDOWN_MS } from "../../config/constants";
 import { recordAudit } from "../../services/audit";
 import { logger } from "../../utils/logger";
 import type { AuthUser } from "../../types/auth";
@@ -98,6 +100,32 @@ export async function approveTask(
   const { point, addressText } = await resolvePublicPoint(task.spot);
   const now = new Date();
   const isAppeal = task.status === "appealed";
+  const isStaleRecheck = task.kind === "stale_recheck";
+
+  // 人工复查一条被降权的条目：复查结论即权威确认。
+  // 清除 stale 标记、抵消历史过期上报，并补一条审核员确认让时间衰减从今天重新起算。
+  // 过期上报清零后再重算，历史反馈不会继续压低一条已被人工正名的条目。
+  let recheckFreshness = 80;
+  if (isStaleRecheck) {
+    const moderatorRecent = await prisma.spotConfirmation.findFirst({
+      where: { spotId: task.spotId, userId: moderator.id, createdAt: { gte: new Date(now.getTime() - CONFIRMATION_COOLDOWN_MS) } },
+      select: { id: true },
+    });
+    // 审核员近期已留过确认就不重复写入，避免冷却期挡住整个复查流程
+    if (!moderatorRecent) {
+      await prisma.spotConfirmation.create({
+        data: { spotId: task.spotId, userId: moderator.id, isAccurate: true, note: "审核员人工复查确认" },
+      });
+    }
+
+    const inputs = await loadFreshnessInputs(prisma, task.spotId);
+    recheckFreshness = computeFreshness({
+      ...inputs,
+      staleReportCount: 0,
+      lastConfirmedAt: now,
+      now,
+    });
+  }
 
   await prisma.$transaction([
     prisma.spot.update({
@@ -110,6 +138,10 @@ export async function approveTask(
         currentRevisionId: task.revisionId,
         publishedAt: task.spot.publishedAt ?? now,
         archivedAt: null,
+        // 人工复查确认后解除降权；过期上报清零，避免历史反馈一直压低分数
+        ...(isStaleRecheck
+          ? { isStale: false, staleReportCount: 0, freshnessScore: recheckFreshness }
+          : {}),
       },
     }),
     prisma.reviewTask.update({
@@ -124,29 +156,48 @@ export async function approveTask(
     }),
   ]);
 
-  await incrementApprovedCount(task.spot.ownerId);
-  await adjustCredit(task.spot.ownerId, CREDIT_DELTAS.SPOT_APPROVED);
+  // 复核通过不是"新条目通过"，不重复给作者加信用分/计数
+  if (!isStaleRecheck) {
+    await incrementApprovedCount(task.spot.ownerId);
+    await adjustCredit(task.spot.ownerId, CREDIT_DELTAS.SPOT_APPROVED);
+  }
 
   await recordAudit({
     actorId: moderator.id,
     action: isAppeal ? AUDIT_ACTIONS.REVIEW_APPEAL_DECIDE : AUDIT_ACTIONS.REVIEW_APPROVE,
     targetType: "spot",
     targetId: task.spotId,
-    after: { status: "published", revisionNo: task.revision.revisionNo },
+    after: {
+      status: "published",
+      revisionNo: task.revision.revisionNo,
+      ...(isStaleRecheck ? { staleRecheck: true, isStale: false, freshnessScore: recheckFreshness } : {}),
+    },
     reason: payload.reason,
   });
 
   await notify({
     userId: task.spot.ownerId,
     type: "review_approved",
-    title: "你的记录已通过审核",
-    body: `已发布到地图：${task.spot.title}`,
-    payload: { spotUuid: task.spot.uuid },
+    title: isStaleRecheck ? "你的记录复查后确认仍然有效" : "你的记录已通过审核",
+    body: isStaleRecheck
+      ? `管理员复查确认现场情况未变，过期标记已解除：${task.spot.title}`
+      : `已发布到地图：${task.spot.title}`,
+    payload: { spotUuid: task.spot.uuid, staleRecheck: isStaleRecheck },
   });
 
-  logger.info({ taskId: taskId.toString(), moderator: moderator.uuid }, "审核通过并发布");
+  logger.info(
+    { taskId: taskId.toString(), moderator: moderator.uuid, staleRecheck: isStaleRecheck },
+    isStaleRecheck ? "人工复查确认，解除过期标记" : "审核通过并发布",
+  );
 
-  return { status: "published" as const, spotUuid: task.spot.uuid, publicLocation: point };
+  return {
+    status: "published" as const,
+    spotUuid: task.spot.uuid,
+    publicLocation: point,
+    staleRecheck: isStaleRecheck,
+    isStale: isStaleRecheck ? false : task.spot.isStale,
+    freshnessScore: isStaleRecheck ? recheckFreshness : task.spot.freshnessScore,
+  };
 }
 
 // 要求修改：把问题拆成逐条修改点，用户才知道该改什么

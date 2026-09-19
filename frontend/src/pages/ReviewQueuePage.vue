@@ -11,6 +11,7 @@ const items = ref<ReviewQueueItem[]>([]);
 const total = ref(0);
 const loading = ref(false);
 const onlyOverdue = ref(false);
+const kindFilter = ref<"" | "submission" | "stale_recheck">("");
 const selecting = ref<string | null>(null);
 
 async function load() {
@@ -20,6 +21,7 @@ async function load() {
       api.get<Paged<ReviewQueueItem>>("/moderation/queue", {
         pageSize: 50,
         overdueOnly: onlyOverdue.value ? "true" : undefined,
+        kind: kindFilter.value || undefined,
       }),
       api.get<{
         queue: { pending: number; inReview: number; overdue: number };
@@ -103,24 +105,37 @@ onMounted(load);
       </el-col>
     </el-row>
 
-    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 10px">
+    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap">
       <el-checkbox v-model="onlyOverdue" @change="load">只看超时的</el-checkbox>
+      <el-radio-group v-model="kindFilter" size="small" @change="load">
+        <el-radio-button value="">全部</el-radio-button>
+        <el-radio-button value="submission">新提交</el-radio-button>
+        <el-radio-button value="stale_recheck">新鲜度复核</el-radio-button>
+      </el-radio-group>
       <span class="muted">共 {{ total }} 条待处理</span>
       <span v-if="statsRef" class="muted">近 30 天平均处理时长 {{ statsRef.averageReviewHours }} 小时</span>
     </div>
 
     <el-table v-loading="loading" :data="items" style="width: 100%">
-      <el-table-column label="条目" min-width="240">
+      <el-table-column label="条目" min-width="260">
         <template #default="{ row }">
-          <div style="display: flex; align-items: center; gap: 8px">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
             <span class="category-chip" :style="{ background: row.spot.category.color }">
               {{ row.spot.category.name }}
             </span>
             <strong>{{ row.spot.title }}</strong>
+            <el-tag v-if="row.kind === 'stale_recheck'" type="warning" size="small">新鲜度复核</el-tag>
+            <el-tag v-if="row.spot.isStale" type="danger" size="small">已降权</el-tag>
           </div>
           <div class="muted" style="margin-top: 4px">
-            作者 {{ row.spot.author.nickname }} · 信用分 {{ row.spot.author.creditScore }} ·
-            已通过 {{ row.spot.author.approvedCount }} 条
+            <template v-if="row.kind === 'stale_recheck'">
+              新鲜度 {{ row.spot.freshnessScore }} · {{ row.spot.confirmCount }} 人确认 ·
+              {{ row.spot.staleReportCount }} 次过期反馈
+            </template>
+            <template v-else>
+              作者 {{ row.spot.author.nickname }} · 信用分 {{ row.spot.author.creditScore }} ·
+              已通过 {{ row.spot.author.approvedCount }} 条
+            </template>
           </div>
         </template>
       </el-table-column>

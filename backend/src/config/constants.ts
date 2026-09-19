@@ -129,6 +129,15 @@ export const CONFIRMATION_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
 /** 过期上报达到该数量后条目进入待复核 */
 export const STALE_REPORT_THRESHOLD = 3;
 
+/** 距离上次确认（无确认则按发布时间）超过该天数，条目自动降权并回灌复核队列 */
+export const STALE_UNCONFIRMED_DAYS = 180;
+
+/** 新鲜度跌破该分数即视为低可信，排序与降权逻辑共用 */
+export const STALE_SCORE_THRESHOLD = 30;
+
+/** 众包"复活"所需的近期准确确认人数：达到后条目提前解除 stale 标记 */
+export const STALE_REVIVAL_CONFIRMATIONS = 2;
+
 /** 举报合并窗口 */
 export const REPORT_MERGE_WINDOW_MS = 24 * 60 * 60 * 1000;
 

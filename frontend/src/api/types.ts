@@ -152,6 +152,7 @@ export interface BlurRegion {
 
 export interface ReviewQueueItem {
   id: string;
+  kind: "submission" | "stale_recheck";
   status: string;
   priority: number;
   createdAt: string;
@@ -164,14 +165,29 @@ export interface ReviewQueueItem {
     uuid: string;
     title: string;
     status: string;
+    isStale: boolean;
+    freshnessScore: number;
+    confirmCount: number;
+    staleReportCount: number;
     category: { code: string; name: string; color: string; icon: string };
     mediaCount: number;
     author: { uuid: string; nickname: string; creditScore: number; approvedCount: number };
   };
 }
 
+export interface RecheckContext {
+  latestConfirmation: { createdAt: string; isAccurate: boolean; note: string | null } | null;
+  recentConfirmations: Array<{
+    createdAt: string;
+    isAccurate: boolean;
+    note: string | null;
+    by: string;
+  }>;
+}
+
 export interface ReviewTaskDetail {
   id: string;
+  kind: "submission" | "stale_recheck";
   status: string;
   priority: number;
   autoCheck: { issues?: Array<{ code: string; message: string }>; passed?: boolean };
@@ -195,6 +211,12 @@ export interface ReviewTaskDetail {
     title: string;
     description: string | null;
     attributes: Record<string, unknown>;
+    freshness: {
+      score: number;
+      isStale: boolean;
+      confirmCount: number;
+      staleReportCount: number;
+    };
     category: { code: string; name: string; color: string; icon: string };
     schemaVersion: number;
     schema: AttributeSchema;
@@ -206,6 +228,7 @@ export interface ReviewTaskDetail {
     author: { uuid: string; nickname: string; creditScore: number; approvedCount: number };
     history: Array<{
       id: string;
+      kind: "submission" | "stale_recheck";
       status: string;
       reasonCode: string | null;
       decisionReason: string | null;
@@ -222,6 +245,7 @@ export interface ReviewTaskDetail {
     regions: BlurRegion[];
   }>;
   reasonCodes: Record<string, string>;
+  recheck: RecheckContext | null;
 }
 
 export interface ReportItem {

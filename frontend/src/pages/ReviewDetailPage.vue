@@ -57,7 +57,7 @@ async function approve() {
       `/moderation/tasks/${taskId.value}/approve`,
       {},
     );
-    ElMessage.success("已通过并发布到地图");
+    ElMessage.success(task.value?.kind === "stale_recheck" ? "复查确认，已解除过期标记" : "已通过并发布到地图");
     void router.push({ name: "spot-detail", params: { uuid: result.spotUuid } });
   } catch (error) {
     ElMessage.error((error as Error).message);
@@ -168,6 +168,41 @@ onMounted(load);
         :description="`还有 ${blockedMedia.length} 张图片没有完成隐私确认。请在下方逐张处理，确认后才能通过审核。`"
         style="margin-bottom: 16px"
       />
+
+      <el-alert
+        v-if="task.kind === 'stale_recheck'"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="这是一条新鲜度回灌的待复核任务"
+        style="margin-bottom: 16px"
+      >
+        <p style="margin: 4px 0">
+          该条目长期无人确认或被多人反馈过期，已被自动降权。请核实现场情况：
+          <strong>通过</strong>会解除过期标记并恢复新鲜度，<strong>驳回 / 要求修改</strong>则按普通审核处理。
+        </p>
+        <p style="margin: 4px 0">
+          当前新鲜度 {{ task.spot.freshness.score }} · 累计 {{ task.spot.freshness.confirmCount }} 人确认 ·
+          {{ task.spot.freshness.staleReportCount }} 次过期反馈
+          <template v-if="task.recheck?.latestConfirmation">
+            · 最近一次{{ task.recheck.latestConfirmation.isAccurate ? "确认" : "过期反馈" }}时间
+            {{ new Date(task.recheck.latestConfirmation.createdAt).toLocaleString("zh-CN") }}
+          </template>
+        </p>
+        <div v-if="task.recheck && task.recheck.recentConfirmations.length > 0" style="margin-top: 6px">
+          <p class="muted" style="margin: 0 0 4px">近 90 天众包复核记录：</p>
+          <el-tag
+            v-for="(item, idx) in task.recheck.recentConfirmations"
+            :key="idx"
+            :type="item.isAccurate ? 'success' : 'danger'"
+            size="small"
+            style="margin: 2px 6px 2px 0"
+          >
+            {{ item.by }} · {{ item.isAccurate ? "仍然准确" : "已过期" }}
+            · {{ new Date(item.createdAt).toLocaleDateString("zh-CN") }}
+          </el-tag>
+        </div>
+      </el-alert>
 
       <el-alert
         v-if="task.appeal"
@@ -294,7 +329,7 @@ onMounted(load);
             <template #header>审核决策</template>
             <div style="display: flex; flex-direction: column; gap: 10px">
               <el-button type="success" :loading="deciding" :disabled="!canApprove" @click="approve">
-                通过并发布
+                {{ task.kind === "stale_recheck" ? "复查通过：现场情况未变" : "通过并发布" }}
               </el-button>
               <el-button :disabled="deciding" @click="openDecision('changes')">要求修改</el-button>
               <el-button type="danger" plain :disabled="deciding" @click="openDecision('reject')">驳回</el-button>

@@ -99,14 +99,18 @@ async function confirmAccuracy(isAccurate: boolean) {
 
   busy.value = true;
   try {
-    const result = await api.post<{ confirmCount: number; isStale: boolean; addedReviewTask: boolean }>(
-      `/spots/${uuid.value}/confirm`,
-      { isAccurate },
-    );
+    const result = await api.post<{
+      confirmCount: number;
+      isStale: boolean;
+      addedReviewTask: boolean;
+      revived?: boolean;
+    }>(`/spots/${uuid.value}/confirm`, { isAccurate });
 
     ElMessage.success(
       isAccurate
-        ? "谢谢确认，这条信息会显示得更可信"
+        ? result.revived
+          ? "谢谢确认！多位用户已复核，过期标记已解除"
+          : "谢谢确认，这条信息会显示得更可信"
         : result.addedReviewTask
           ? "已记录你的反馈，这条信息会重新进入复核"
           : "已记录你的反馈",

@@ -1,7 +1,6 @@
 import { prisma } from "../db/prisma";
-import { env } from "../config/env";
-import { STALE_REPORT_THRESHOLD } from "../config/constants";
 import { computeFreshness } from "../services/moderation/credit";
+import { enqueueStaleRecheck, shouldAutoStale } from "../services/moderation/freshness";
 import { purgeOriginal } from "../modules/media/service";
 import { notify } from "../services/notify";
 import { logger } from "../utils/logger";
@@ -77,9 +76,11 @@ export async function slaSweep(): Promise<{ overdueTasks: number; overdueReports
 
 /**
  * 新鲜度巡检：每天一次。
- * 重算分数、标记过期条目，并为过期条目生成待复核任务。
+ * 重算分数、对长期无人确认的条目自动降权打标，并把它们以 stale_recheck
+ * 任务回灌审核队列等待人工复查确认。
  */
-export async function staleSweep(): Promise<{ recomputed: number; markedStale: number }> {
+export async function staleSweep(): Promise<{ recomputed: number; markedStale: number; requeued: number }> {
+  const now = new Date();
   const spots = await prisma.spot.findMany({
     where: { status: "published", deletedAt: null },
     select: {
@@ -88,8 +89,8 @@ export async function staleSweep(): Promise<{ recomputed: number; markedStale: n
       ownerId: true,
       confirmCount: true,
       staleReportCount: true,
-      publishedAt: true,
       isStale: true,
+      publishedAt: true,
       confirmations: {
         where: { isAccurate: true },
         orderBy: { createdAt: "desc" },
@@ -100,20 +101,17 @@ export async function staleSweep(): Promise<{ recomputed: number; markedStale: n
   });
 
   let markedStale = 0;
+  let requeued = 0;
 
   for (const spot of spots) {
-    const freshnessScore = computeFreshness({
+    const inputs = {
       confirmCount: spot.confirmCount,
       staleReportCount: spot.staleReportCount,
       lastConfirmedAt: spot.confirmations[0]?.createdAt ?? null,
       publishedAt: spot.publishedAt,
-    });
-
-    // 长期没有任何确认，且分数跌破 30，视为疑似过期
-    const shouldMarkStale =
-      !spot.isStale &&
-      (spot.staleReportCount >= STALE_REPORT_THRESHOLD ||
-        (freshnessScore < 30 && spot.confirmCount === 0));
+    };
+    const freshnessScore = computeFreshness({ ...inputs, now });
+    const shouldMarkStale = !spot.isStale && shouldAutoStale(inputs, now);
 
     await prisma.spot.update({
       where: { id: spot.id },
@@ -123,41 +121,24 @@ export async function staleSweep(): Promise<{ recomputed: number; markedStale: n
     if (shouldMarkStale) {
       markedStale += 1;
 
-      const revision = await prisma.spotRevision.findFirst({
-        where: { spotId: spot.id },
-        orderBy: { revisionNo: "desc" },
-        select: { id: true },
+      const enqueued = await prisma.$transaction((tx) => enqueueStaleRecheck(tx, { id: spot.id, uuid: spot.uuid }, "STALE_SWEEP"));
+      if (enqueued) requeued += 1;
+
+      await notify({
+        userId: spot.ownerId,
+        type: "spot_stale",
+        title: "你记录的这条信息需要重新确认",
+        body: "已经有一段时间没有人确认这条记录了，麻烦你有空时更新一下现场情况。",
+        payload: { spotUuid: spot.uuid },
       });
-
-      const openTask = await prisma.reviewTask.findFirst({
-        where: { spotId: spot.id, decidedAt: null },
-        select: { id: true },
-      });
-
-      if (revision && !openTask) {
-        await prisma.reviewTask.create({
-          data: {
-            spotId: spot.id,
-            revisionId: revision.id,
-            status: "pending",
-            priority: 2,
-            slaDueAt: new Date(Date.now() + env.REVIEW_SLA_HOURS * 3600000),
-            autoCheck: { issues: [{ code: "STALE_SWEEP", message: "长时间无人确认，信息可能已过期" }] },
-          },
-        });
-
-        await notify({
-          userId: spot.ownerId,
-          type: "spot_stale",
-          title: "你记录的这条信息需要重新确认",
-          body: "已经有一段时间没有人确认这条记录了，麻烦你有空时更新一下现场情况。",
-          payload: { spotUuid: spot.uuid },
-        });
-      }
     }
   }
 
-  return { recomputed: spots.length, markedStale };
+  if (markedStale > 0) {
+    logger.warn({ markedStale, requeued }, "新鲜度巡检对长期无人确认的条目降权并回灌复核队列");
+  }
+
+  return { recomputed: spots.length, markedStale, requeued };
 }
 
 /**

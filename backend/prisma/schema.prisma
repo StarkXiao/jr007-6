@@ -39,6 +39,11 @@ enum SpotStatus {
   archived
 }
 
+enum ReviewKind {
+  submission
+  stale_recheck
+}
+
 enum ReviewStatus {
   pending
   in_review
@@ -317,6 +322,7 @@ model ReviewTask {
   id              BigInt       @id @default(autoincrement())
   spotId          BigInt       @map("spot_id")
   revisionId      BigInt       @map("revision_id")
+  kind            ReviewKind   @default(submission)
   status          ReviewStatus @default(pending)
   priority        Int          @default(0) @db.SmallInt
   autoCheck       Json?        @map("auto_check")
